@@ -962,21 +962,28 @@ class MyAxes:
             self._get_label_rotation_and_horizontal_alignment("x")
         )
         if x_tick_rotation_and_horizontal_alignment:
-            self.data.current_axis_options.add(x_tick_rotation_and_horizontal_alignment)
+            self.data.current_axis_options.add(
+                x_tick_rotation_and_horizontal_alignment
+            )
 
         y_tick_rotation_and_horizontal_alignment = (
             self._get_label_rotation_and_horizontal_alignment("y")
         )
         if y_tick_rotation_and_horizontal_alignment:
-            self.data.current_axis_options.add(y_tick_rotation_and_horizontal_alignment)
+            self.data.current_axis_options.add(
+                y_tick_rotation_and_horizontal_alignment
+            )
 
-        z_tick_rotation_and_horizontal_alignment = (
-            self._get_label_rotation_and_horizontal_alignment("z")
-        )
-        if z_tick_rotation_and_horizontal_alignment:
-            self.data.current_axis_options.add(z_tick_rotation_and_horizontal_alignment)
+        # Z-axis tick formatting applies only to 3D plots.
+        if self.is_3d:
+            z_tick_rotation_and_horizontal_alignment = (
+                self._get_label_rotation_and_horizontal_alignment("z")
+            )
+            if z_tick_rotation_and_horizontal_alignment:
+                self.data.current_axis_options.add(
+                    z_tick_rotation_and_horizontal_alignment
+                )
 
-    # TODO: z functionality for _set_tick_positions
     def _set_tick_positions(self) -> None:
         x_tick_position_string, x_tick_position = _get_effective_tick_position(self.obj, "x")
         y_tick_position_string, y_tick_position = _get_effective_tick_position(self.obj, "y")
