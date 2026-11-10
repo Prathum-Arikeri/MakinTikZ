@@ -11,7 +11,9 @@ import numpy as np
 from matplotlib.axes import Subplot
 from matplotlib.colorbar import Colorbar
 from matplotlib.colors import Colormap, LinearSegmentedColormap, ListedColormap
+from matplotlib.projections.polar import PolarAxes
 from matplotlib.ticker import ScalarFormatter
+from mpl_toolkits.axes_grid1.mpl_axes import Axes as AxesGrid
 from mpl_toolkits.mplot3d.axes3d import Axes3D
 
 from . import _color
@@ -135,6 +137,9 @@ class MyAxes:
         self.side_title_content: list[str] = []
         self.is_3d = isinstance(obj, Axes3D)
 
+        # must be instantiated before _setup_standable_colorbar()
+        self.is_polar = False
+
         # Are we dealing with an axis that hosts a colorbar? Skip then, those are
         # treated implicitily by the associated axis. Exception: standalone colorbar
         # (figure has only this axes) must be processed.
@@ -153,6 +158,12 @@ class MyAxes:
 
         if isinstance(obj, Subplot):
             self._subplot()
+
+        if isinstance(obj, AxesGrid):
+            self._set_axes_grid()
+
+        if isinstance(obj, PolarAxes):
+            self._polar()
 
         data.current_axis_options = set()  # Reset axis options
 
@@ -244,7 +255,9 @@ class MyAxes:
                 self.data.current_axis_options.add(f"xlabel={{{xlabel}}}")
 
             xrotation = self.obj.xaxis.get_label().get_rotation()
-            if xrotation != 0:
+            if self.is_3d:
+                self.data.current_axis_options.add(f"xlabel style={{sloped}}")
+            elif xrotation != 0:
                 self.data.current_axis_options.add(f"xlabel style={{rotate={xrotation - 90}}}")
 
         ylabel = self.obj.get_ylabel()
@@ -259,8 +272,23 @@ class MyAxes:
                 self.data.current_axis_options.add(f"ylabel={{{ylabel}}}")
 
             yrotation = self.obj.yaxis.get_label().get_rotation()
-            if yrotation != 90:  # noqa: PLR2004
+            if self.is_3d:
+                self.data.current_axis_options.add(f"ylabel style={{sloped}}")
+            elif yrotation != 90:  # noqa: PLR2004
                 self.data.current_axis_options.add(f"ylabel style={{rotate={yrotation - 90}}}")
+
+        if self.is_3d:
+            zlabel = self.obj.get_zlabel()
+            if zlabel:
+                zlabel = _common_texification(zlabel)
+
+                labelcolor = self.obj.yaxis.label.get_color()
+                if labelcolor != "black":
+                    col, _ = _color.mpl_color2xcolor(self.data, labelcolor)
+                    self.data.current_axis_options.add(f"zlabel=\\textcolor{{{col}}}{{{zlabel}}}")
+                else:
+                    self.data.current_axis_options.add(f"zlabel={{{zlabel}}}")
+                # let pgfplots handle zlabel rotation
 
     def _set_axis_limits(self) -> tuple[list[float], list[float], list[float] | None]:
         ff = self.data.float_format
@@ -269,8 +297,17 @@ class MyAxes:
         ylim = list(self.obj.get_ylim())
         ylim0, ylim1 = sorted(ylim)
         # Sort the limits so make sure that the smaller of the two is actually *min.
+        if self.is_polar:
+            xlim0 = np.degrees(xlim0)
+            xlim1 = np.degrees(xlim1)
+
         self.data.current_axis_options.add(f"xmin={xlim0:{ff}}, xmax={xlim1:{ff}}")
-        self.data.current_axis_options.add(f"ymin={ylim0:{ff}}, ymax={ylim1:{ff}}")
+        if not self.is_polar:
+            # If the plot is polar, allow PGFPlots to manage ymax, since polar plots
+            # require additional margin in the radius to display tick marks that do not
+            # collide with the theta axis.
+            self.data.current_axis_options.add(f"ymin={ylim0:{ff}}, ymax={ylim1:{ff}}")
+
         # When the axis is inverted add additional option
         if xlim != sorted(xlim):
             self.data.current_axis_options.add("x dir=reverse")
@@ -336,8 +373,6 @@ class MyAxes:
             if self.data.axis_height:
                 self.data.current_axis_options.add("height=" + self.data.axis_height)
             return
-
-            # TODO: investigate if alpha part necessary, also if we need zlim as argument
         
         if aspect_num == 1.0:
             # Equal aspect (e.g. set_aspect("equal")): ensure circles appear round
@@ -372,7 +407,7 @@ class MyAxes:
                 self.data.current_axis_options.add("width=" + self.data.axis_width)
 
     def _set_axis_positions(self) -> None:
-        # This is temporary and may not be the best handling for 3d plots.
+        # TODO: confirm this is proper z handling, fix if not
         if self.is_3d:
             return
 
@@ -487,9 +522,55 @@ class MyAxes:
                     orphan_style_line=z_orphan,
                 ),
             )
+        
+
+    def _set_axes_grid(self) -> None:
+        # TODO: add z coordinate handling to this method
+        # https://github.com/AlexChrzanowski/MakinTikZ/issues/64
+        if self.obj.figure is not None:
+            axes = [ax for ax in self.obj.figure.get_axes() if type(ax) is type(self.obj)]
+            if len(axes) > 1:
+                self.is_subplot = True
+            else:
+                return
+        else:
+            return
+
+        # locator_cols and locator_rows ensures that plots in the same row/col
+        # are not double-counted.
+        locator_cols = set()
+        locator_rows = set()
+        col_size = 0
+        row_size = 0
+
+        for ax in axes:
+            loc = getattr(ax.get_axes_locator(), "args", None)  # nx, ny, nx1, ny1
+            if loc is None:
+                continue
+            x_coords = (loc[2], loc[0])
+            y_coords = (loc[3], loc[1])
+
+            if x_coords not in locator_cols and loc[2] - loc[0] > 0:
+                locator_cols.add(x_coords)
+                col_size += 1
+            if y_coords not in locator_rows and loc[3] - loc[1] > 0:
+                locator_rows.add(y_coords)
+                row_size += 1
+
+        if not self.data.is_in_groupplot_env:
+            group_style = [f"group size={col_size} by {row_size}"]
+            group_style.extend(self.data.extra_groupstyle_options)
+            options = ["group style={{{}}}".format(", ".join(group_style))]
+            self.content.append(self.data.flavor.start("groupplot") + f"[{', '.join(options)}]")
+            self.data.is_in_groupplot_env = True
+            self.data.pgfplots_libs.add("groupplots")
+
+    def _polar(self) -> None:
+        self.is_polar = True
+        self.data.pgfplots_libs.add("polaraxis")
 
     def _set_axis_line_styles(self) -> None:
-        if self.is_3d: # TODO: review this section
+        if self.is_3d:
             # Axes3D stores boundary lines on the individual 3D axis objects
             line = getattr(self.obj.xaxis, "line", None)
             if line is not None:
@@ -498,7 +579,10 @@ class MyAxes:
                 axcol = plt.rcParams.get("axes.edgecolor", "black")
         else:
             # Assume that the bottom edge color is the color of the entire box.
-            axcol = self.obj.spines["bottom"].get_edgecolor()
+            if hasattr(self.obj.spines, "bottom"):
+                axcol = self.obj.spines["bottom"].get_edgecolor()
+            else:
+                axcol = self.obj.spines["polar"].get_edgecolor()
         
         col, _ = _color.mpl_color2xcolor(self.data, axcol)
         if col != "black":
@@ -609,6 +693,8 @@ class MyAxes:
     def _content_end(self) -> None:
         if self.is_subplot:
             self.content.append("\n\\nextgroupplot")
+        elif self.is_polar:
+            self.content.append(self.data.flavor.start("polaraxis"))
         else:
             self.content.append(self.data.flavor.start("axis"))
 
@@ -629,7 +715,10 @@ class MyAxes:
 
     def get_end_code(self) -> str:
         if not self.is_subplot:
+            if self.is_polar:
+                return self.data.flavor.end("polaraxis") + "\n\n"
             return self.data.flavor.end("axis") + "\n\n"
+
         if self.is_subplot and self.nsubplots == self.subplot_index:
             self.data.is_in_groupplot_env = False
             return self.data.flavor.end("groupplot") + "\n\n"
@@ -649,7 +738,7 @@ class MyAxes:
         self.data.current_axis_options.update(
             _get_ticks(
                 self.data,
-                "x",
+                "x" + (" polar" if self.is_polar else ""),
                 self.obj.get_xticks(),
                 self.obj.get_xticklabels(),
                 force_label_required=force_x_ticklabels,
@@ -658,7 +747,7 @@ class MyAxes:
         self.data.current_axis_options.update(
             _get_ticks(
                 self.data,
-                "y",
+                "y" + (" polar" if self.is_polar else ""),
                 self.obj.get_yticks(),
                 self.obj.get_yticklabels(),
                 force_label_required=force_y_ticklabels,
@@ -678,7 +767,7 @@ class MyAxes:
         self.data.current_axis_options.update(
             _get_ticks(
                 self.data,
-                "minor x",
+                "minor x" + (" polar" if self.is_polar else ""),
                 self.obj.get_xticks(minor=True),
                 self.obj.get_xticklabels(minor=True),
             )
@@ -686,7 +775,7 @@ class MyAxes:
         self.data.current_axis_options.update(
             _get_ticks(
                 self.data,
-                "minor y",
+                "minor y" + (" polar" if self.is_polar else ""),
                 self.obj.get_yticks(minor=True),
                 self.obj.get_yticklabels(minor=True),
             )
@@ -751,8 +840,8 @@ class MyAxes:
                 if self.data.strict:
                     tick_options += ", "
                     params = self.obj.get_zaxis().get_tick_params()
-                    tick_options += self._get_tick_style_options(params, "z", is_minor=False)
-                    label_options = self._get_tick_label_options(params, "z")
+                    # NOT SUPPORTED FOR 3D PLOTS
+                    # Do not get ztick styles - there are no ztick related rcParam keys in Matplotlib
                     self.data.current_axis_options.add(f"zticklabel style={{{label_options}}}")
                 self.data.current_axis_options.add(
                     f"ztick style={{color={ztickcolor}{tick_options.strip()}}}"
@@ -797,6 +886,8 @@ class MyAxes:
                 )
 
     def _get_tick_style_options(self, params: dict, axis: str, *, is_minor: bool) -> str:
+        # NOT SUPPORTED FOR 3D PLOTS
+        # No support for z ticks, as Matplotlib does not have z tick rcParams
         tick_options = ""
         minor_or_major = "major" if is_minor is False else "minor"
         rcparams_key = axis + "tick." + minor_or_major + "."
@@ -807,8 +898,9 @@ class MyAxes:
         tick_options += f"line width={width}pt, "
         return tick_options.removesuffix(", ")
 
-    # TODO: z functionality for _get_tick_label_options
     def _get_tick_label_options(self, params: dict, axis: str) -> str:
+        # NOT SUPPORTED FOR 3D PLOTS
+        # No support for z ticks, as Matplotlib does not have z tick rcParams
         label_options = ""
         opposite_axis = "x" if "y" in axis else "y"
         anchor = "north" if "x" in axis else "east"
@@ -817,7 +909,12 @@ class MyAxes:
 
         # Shifts label options to account for tick length
         # removes initial offset
-        label_options += f"inner sep=0pt, anchor={anchor}, {opposite_axis}shift=0pt, "
+        label_options += f"inner sep=0pt, {opposite_axis}shift=0pt, "
+        if not self.is_polar and "y" not in axis:
+            # Allow PGFPlots to handle polar plot tick label position, to avoid
+            # colliding tick labels with the theta axis
+            label_options += f"anchor={anchor}"
+
         self.data.current_axis_options.add(f"{opposite_axis}ticklabel shift={length}pt")
 
         # Updates label color
@@ -848,7 +945,7 @@ class MyAxes:
                 # y_tick_dirs must be present
                 direction = y_tick_dirs[0]
 
-            if direction:
+            if direction and not (self.is_3d and not self.data.strict):
                 if direction == "in":
                     # 'tick align=inside' is the PGFPlots default
                     pass
@@ -860,7 +957,6 @@ class MyAxes:
                     msg = f"Direction can be 'in', 'out', or 'inout', but is '{direction}'."
                     raise ValueError(msg)
 
-    # TODO: z functionality for _set_tick_rotation
     def _set_tick_rotation(self) -> None:
         x_tick_rotation_and_horizontal_alignment = (
             self._get_label_rotation_and_horizontal_alignment("x")
@@ -874,6 +970,12 @@ class MyAxes:
         if y_tick_rotation_and_horizontal_alignment:
             self.data.current_axis_options.add(y_tick_rotation_and_horizontal_alignment)
 
+        z_tick_rotation_and_horizontal_alignment = (
+            self._get_label_rotation_and_horizontal_alignment("z")
+        )
+        if z_tick_rotation_and_horizontal_alignment:
+            self.data.current_axis_options.add(z_tick_rotation_and_horizontal_alignment)
+
     # TODO: z functionality for _set_tick_positions
     def _set_tick_positions(self) -> None:
         x_tick_position_string, x_tick_position = _get_effective_tick_position(self.obj, "x")
@@ -882,13 +984,16 @@ class MyAxes:
         # When x-ticks are only on top (tick_top), use xtick pos=right only - do NOT
         # use axis x line*=top, which would remove the bottom axis line. Matplotlib
         # keeps the bottom axis line and only moves ticks to top.
-        if x_tick_position == y_tick_position and x_tick_position is not None:
-            self.data.current_axis_options.add(f"tick pos={x_tick_position}")
-        else:
-            if x_tick_position_string is not None:
-                self.data.current_axis_options.add(x_tick_position_string)
-            if y_tick_position_string is not None:
-                self.data.current_axis_options.add(y_tick_position_string)
+        if not self.is_3d and not self.data.strict:
+            # NOT SUPPORTED FOR 3D PLOTS
+            # We want to default to PGFPlot styles
+            if x_tick_position == y_tick_position and x_tick_position is not None:
+                self.data.current_axis_options.add(f"tick pos={x_tick_position}")
+            else:
+                if x_tick_position_string is not None:
+                    self.data.current_axis_options.add(x_tick_position_string)
+                if y_tick_position_string is not None:
+                    self.data.current_axis_options.add(y_tick_position_string)
 
     def _subplot(self) -> None:
         # https://github.com/matplotlib/matplotlib/issues/7225#issuecomment-252173667
@@ -951,8 +1056,11 @@ class MyAxes:
             anchor = {"right": "east", "left": "west", "center": "center"}[
                 tick_labels_horizontal_alignment[0]
             ]
-            if not (x_or_y == "x" and anchor == "center") and not (
-                x_or_y == "y" and anchor == "east"
+            if (
+                not (x_or_y == "x" and anchor == "center")
+                and not (x_or_y == "y" and anchor == "east")
+                and not (self.is_polar and x_or_y == "y")
+                and not (self.is_3d)
             ):
                 values.append(f"anchor={anchor}")
 
@@ -972,7 +1080,7 @@ class MyAxes:
         elev = getattr(self.obj, "elev", None)
         # MakinTikz will directly use the view and not a "default"
         if azim is not None and elev is not None:
-            self.data.current_axis_options.add(f"view={{{azim}}}{{{elev}}}")
+            self.data.current_axis_options.add(f"view={{{azim + 90}}}{{{elev}}}")
 
 
 # TODO: z functionality for _get_tick_position
@@ -981,6 +1089,8 @@ def _get_tick_position(obj: Axes, x_or_y: str) -> tuple[str | None, str | None]:
 
     major_ticks_bottom = [tick.tick1line.get_visible() for tick in major_ticks]
     major_ticks_top = [tick.tick2line.get_visible() for tick in major_ticks]
+
+    major_ticks_visible = [tick.get_visible() for tick in major_ticks]
 
     major_ticks_bottom_show_all = False
     if len(set(major_ticks_bottom)) == 1 and major_ticks_bottom[0] is True:
@@ -992,7 +1102,7 @@ def _get_tick_position(obj: Axes, x_or_y: str) -> tuple[str | None, str | None]:
 
     position_string = None
     major_ticks_position = None
-    if not major_ticks_bottom_show_all and not major_ticks_top_show_all:
+    if not major_ticks_visible:
         position_string = f"{x_or_y}majorticks=false"
     elif major_ticks_bottom_show_all and major_ticks_top_show_all:
         major_ticks_position = "both"
@@ -1026,6 +1136,11 @@ def _get_ticks(
     )
     pgfplots_ticklabels = _get_pgfplots_ticklabels(ticklabels)
 
+    is_polar = "polar" in xyz
+    if is_polar:
+        ticks = [np.degrees(t) for t in ticks]
+    xyz = xyz.replace(" polar", "")
+
     # PGFPlots does not support custom labels for minor ticks (e.g., "minor xticklabels"
     # is not a valid key), so skip ticklabels for minor ticks.
     # if the labels are all missing, then we need to output an empty set of labels
@@ -1037,7 +1152,7 @@ def _get_ticks(
     # Leave the ticks to PGFPlots if not in STRICT mode and if there are no explicit
     # labels.
     if data.strict or is_label_required:
-        if len(ticks):
+        if len(ticks) > 0:
             ff = data.float_format
             axis_options.append(
                 "{}tick={{{}}}".format(xyz, ",".join([f"{el:{ff}}" for el in ticks]))
@@ -1311,7 +1426,19 @@ def _handle_listed_color_map(cmap: ListedColormap, data: TikzData) -> tuple[str,
     }
     for mpl_cm_name, pgf_cm in cm_translate.items():
         mpl_cm = plt.get_cmap(mpl_cm_name)
-        if isinstance(mpl_cm, ListedColormap) and cmap.colors == mpl_cm.colors:
+        if isinstance(mpl_cm, ListedColormap):
+            arr_mpl_cm = np.asarray(mpl_cm.colors)
+        arr_cmap = np.asarray(cmap.colors)
+
+        are_arrays_equal = False
+        if (np.shape(arr_cmap)[1]) > np.shape(arr_mpl_cm)[1]:
+            # truncates columns to match the expected rgb column values
+            arr_cmap = arr_cmap[:, :3]
+            are_arrays_equal = np.array_equal(arr_cmap, arr_mpl_cm)
+        elif np.shape(arr_cmap) == np.shape(arr_mpl_cm):
+            are_arrays_equal = mpl_cm == cmap
+
+        if are_arrays_equal:
             is_custom_colormap = False
             return pgf_cm, is_custom_colormap
 
@@ -1325,7 +1452,7 @@ def _handle_listed_color_map(cmap: ListedColormap, data: TikzData) -> tuple[str,
         colors = [
             f"rgb({k}{unit})=({rgb[0]:{ff}},{rgb[1]:{ff}},{rgb[2]:{ff}})"
             for k, rgb in enumerate(cmap.colors)
-            if isinstance(rgb, list)
+            if isinstance(rgb, (list, np.ndarray))
         ]
     elif isinstance(cmap.colors, list):
         reps = int(float(cmap.N) / len(cmap.colors) - 0.5) + 1
